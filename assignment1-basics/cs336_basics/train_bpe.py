@@ -66,12 +66,6 @@ def train_bpe(
             # do merge
             merges.append(most_common_pair)
             vocab[len(vocab)] = most_common_pair[0] + most_common_pair[1]
-            if len(merges) == 8:
-                print("actual e-r:", pair_counter.get((b"e", b"r")))
-
-                for item in max_heap:
-                    if item[-1] == (b"e", b"r"):
-                        print("heap e-r:", item)
             # pair_counter need update pairs that needs re-calculation, eg. previously widest 3, newest 6 -> es 9, st 9, after merging es, st should update to 0
             # pair counter updated -> max_heap need update too
             pretoken_counter = apply_merge(pretoken_counter, most_common_pair, pair_counter, max_heap)
@@ -126,14 +120,14 @@ def apply_merge(
     for pretoken, pretoken_count in pretoken_counter.items():
         new_symbols = []
         i = 0
-        merged_positions = []
+        changed = False
 
         while i<len(pretoken):
 
             # merge first, then recalculate, otherwise XYXY will be XYX, Y
             if (i+1 < len(pretoken) and pretoken[i] == most_common_pair[0] and pretoken[i+1] == most_common_pair[1]):
                 new_symbols.append(pretoken[i] + pretoken[i+1])
-                merged_positions.append(i)
+                changed = True
                 i += 2
             else:
                 new_symbols.append(pretoken[i])
@@ -142,36 +136,20 @@ def apply_merge(
         new_pretoken = tuple(new_symbols)
         merged_counter[new_pretoken] += pretoken_count
 
-        if not merged_positions:
+        if not changed:
             continue
 
-        # update affected: left and right adjacent
-        for old_index in merged_positions:
+        # use pretokens to do removing old pairs, including merged pair
+        for i in range(len(pretoken)-1):
+            old_pair = pretoken[i: i+2]
+            pair_counter[old_pair] -= pretoken_count # we: 8-6, no need to update heap, stale check
+            updated_pairs.add(old_pair)
 
-            # left
-            if old_index > 0:
-                old_pair = (pretoken[old_index-1], pretoken[old_index])
-                new_pair = (pretoken[old_index - 1], new_symbol)
-
-                pair_counter[old_pair] -= pretoken_count # we: 8-6, no need to update heap, stale check
-                pair_counter[new_pair] += pretoken_count
-
-                updated_pairs.add(old_pair)
-                updated_pairs.add(new_pair)
-
-            # right
-            if old_index<len(pretoken)-2:
-                old_pair = (pretoken[old_index + 1], pretoken[old_index + 2])
-                new_pair = (new_symbol, pretoken[old_index+2])
-
-                pair_counter[old_pair] -= pretoken_count # st: 9-9, no need to update heap, stale check
-                pair_counter[new_pair] += pretoken_count
-                updated_pairs.add(old_pair)
-                updated_pairs.add(new_pair)
-
-            # remove merged pair
-            pair_counter[most_common_pair] -= pretoken_count # es: 9-9
-            updated_pairs.add(most_common_pair)
+        # use new_pretokens to do adding new pairs
+        for i in range(len(new_pretoken)-1):
+            new_pair = new_pretoken[i: i+2]
+            pair_counter[new_pair] += pretoken_count
+            updated_pairs.add(new_pair)
 
     for pair in updated_pairs:
         count = pair_counter.get(pair, 0)
