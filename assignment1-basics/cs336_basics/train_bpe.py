@@ -5,6 +5,7 @@ from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 import heapq
 from itertools import repeat
+from collections import defaultdict
 
 from .pretokenization_example import find_chunk_boundaries
 
@@ -38,10 +39,19 @@ def train_bpe(
         # run BPE
         # example after pre tokenizing:  [('l', 'o', 'w): 5, ('l', 'o', 'w', 'e', 'r'): 2, ('n', 'e', 'w', 'e', 's', 't'): 3]
         # use heap, and mark pairs that needs updating
+
+        # optimization #1
+        # use a list to maintain a pretokens, so that list[i] represent 'l', 'o', 'w' and even lo merged, list [i] still represents 'lo', w'
+        # change of list[i] (pretoken) can be inplace
+        pretoken_words = list(pretoken_counter.keys())
+        pretoken_words_counts = list(pretoken_counter.values())
+        pair_to_words = defaultdict(set)
+
         pair_counter = Counter()
-        for pretoken, count in pretoken_counter.items():
+        for index, (pretoken, count) in enumerate(zip(pretoken_words, pretoken_words_counts)):
             for i in range(len(pretoken)-1):
                 pair_counter[pretoken[i: i+2]] += count
+                pair_to_words[pretoken[i: i+2]].add(index)
 
         max_heap = [
             (-count, ReversePair(pair), pair)
@@ -68,7 +78,7 @@ def train_bpe(
             vocab[len(vocab)] = most_common_pair[0] + most_common_pair[1]
             # pair_counter need update pairs that needs re-calculation, eg. previously widest 3, newest 6 -> es 9, st 9, after merging es, st should update to 0
             # pair counter updated -> max_heap need update too
-            pretoken_counter = apply_merge(pretoken_counter, most_common_pair, pair_counter, max_heap)
+            pretoken_words, pretoken_words_counts = apply_merge(pretoken_words, pretoken_words_counts, pair_to_words, most_common_pair, pair_counter, max_heap)
 
     return (vocab, merges)
 
@@ -107,48 +117,53 @@ def pretokenize_chunk(
     return counter
 
 def apply_merge(
-        pretoken_counter: dict[tuple[bytes, ...], int], 
+        pretoken_words: list[tuple[bytes, ...]],
+        pretoken_words_counts: list[int],
+        pair_to_words: dict[tuple, list[int]],
         most_common_pair: tuple[bytes, bytes], 
         pair_counter: dict[tuple[bytes, ...], int], 
         max_heap:  list[tuple[int, tuple[bytes]]]) -> dict[tuple[bytes], int]:
     # after merge: pretoken_counter: [('l', 'o', 'w'): 5, ('l', 'o', 'w', 'e', 'r'): 2, ('n', 'e', 'w', 'es', 't'): 3, ('n', 'e', 'w', 'es', 't'): 6]
     # pair_counter: {lo: 7, ow: 7, we: 8-6, er: 2, wi: 3, id: 3, de: 3, es: 9-9, st: 9-9, ne: 6, ew: 6, wes: 9, est: 9}
-    merged_counter = Counter()
+    # before merge: pretoken_words: [('l', 'o', 'w'), ('l', 'o', 'w', 'e', 'r'), ('n', 'e', 'w', 'e', 's', 't')]
+    # before merge: pretoken_words_counts: [5, 2, 3]
+    # before merge: pair_to_words: {lo: [1, 2], ow: [1,2], we: [2], er: [2]}
+    
     updated_pairs = set()
-    new_symbol = most_common_pair[0] + most_common_pair[1]
 
-    for pretoken, pretoken_count in pretoken_counter.items():
-        new_symbols = []
-        i = 0
-        changed = False
+    # optimization #1 no traverse to find which need update, use pair_to_words directly
+    # and update pretoken inplace in pretoken_words, no merged_counter needed
+    # how to handle pair_counter update? - same?
+    indexes_need_update = pair_to_words.pop(most_common_pair)
+    for index in indexes_need_update:
+        word_need_update = pretoken_words[index]
+        new_tuple_list = []
 
-        while i<len(pretoken):
-
-            # merge first, then recalculate, otherwise XYXY will be XYX, Y
-            if (i+1 < len(pretoken) and pretoken[i] == most_common_pair[0] and pretoken[i+1] == most_common_pair[1]):
-                new_symbols.append(pretoken[i] + pretoken[i+1])
-                changed = True
-                i += 2
-            else:
-                new_symbols.append(pretoken[i])
-                i+=1
-
-        new_pretoken = tuple(new_symbols)
-        merged_counter[new_pretoken] += pretoken_count
-
-        if not changed:
-            continue
-
-        # use pretokens to do removing old pairs, including merged pair
-        for i in range(len(pretoken)-1):
-            old_pair = pretoken[i: i+2]
-            pair_counter[old_pair] -= pretoken_count # we: 8-6, no need to update heap, stale check
+        # removing old pairs before merge
+        for i in range(len(word_need_update)-1):
+            old_pair = word_need_update[i: i+2]
+            pair_to_words[old_pair].discard(index)
+            pair_counter[old_pair] -= pretoken_words_counts[index] # we: 8-6, no need to update heap, stale check
             updated_pairs.add(old_pair)
 
-        # use new_pretokens to do adding new pairs
+        i = 0
+        while i< len(word_need_update):
+            if (i+1 < len(word_need_update) and word_need_update[i] == most_common_pair[0] and word_need_update[i+1] == most_common_pair[1]):
+                new_tuple_list.append(most_common_pair[0] + most_common_pair[1])
+                i+=2
+                continue
+            new_tuple_list.append(word_need_update[i])
+            i+=1
+
+        new_pretoken = tuple(new_tuple_list)
+        pretoken_words[index] = new_pretoken
+
+        i = 0
+        # adding new pairs after merge
         for i in range(len(new_pretoken)-1):
             new_pair = new_pretoken[i: i+2]
-            pair_counter[new_pair] += pretoken_count
+            pair_to_words[new_pair].add(index)
+            pair_counter[new_pair] += pretoken_words_counts[index]
             updated_pairs.add(new_pair)
 
     for pair in updated_pairs:
@@ -158,8 +173,7 @@ def apply_merge(
             continue
         heapq.heappush( max_heap,(-count, ReversePair(pair), pair))
 
-    
-    return merged_counter
+    return (pretoken_words, pretoken_words_counts)
 
 def reverse_bytes(b: bytes) -> bytes:
     return bytes(255 - x for x in b)
