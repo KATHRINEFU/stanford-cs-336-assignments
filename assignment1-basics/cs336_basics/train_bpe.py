@@ -17,7 +17,11 @@ def train_bpe(
     special_tokens: list[str],
     **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    num_of_process = 4
+    # Number of worker processes (how many chunks are processed at the same time).
+    num_of_process = kwargs.get("num_processes", min(4, os.cpu_count() or 1))
+    # Target size of each chunk. Each worker holds only ONE chunk in memory at a time,
+    # so smaller chunks -> lower peak memory. Decoupled from num_of_process on purpose.
+    target_chunk_bytes = kwargs.get("chunk_bytes", 50 * 1024 * 1024)  # 50MB
     
     pretoken_counter = Counter() # dict[tuple[bytes], int]
     vocab: dict[int, bytes] = {token_id: bytes([token_id]) for token_id in range(256)}
@@ -26,7 +30,10 @@ def train_bpe(
     merges: list[tuple[bytes, bytes]] = []
 
     with open(input_path, "rb") as f:
-        boundaries = find_chunk_boundaries(f, num_of_process, [token.encode('utf-8') for token in special_tokens])
+        file_size = os.path.getsize(input_path)
+        # e.g. 2.2GB / 50MB -> ~45 chunks, still only num_of_process workers running at once
+        num_chunks = max(num_of_process, file_size // target_chunk_bytes)
+        boundaries = find_chunk_boundaries(f, num_chunks, [token.encode('utf-8') for token in special_tokens])
         ranges = list(zip(boundaries[:-1], boundaries[1:]))
         
         with ProcessPoolExecutor(max_workers=num_of_process) as executor:
